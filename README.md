@@ -1,2 +1,2 @@
 # test
-Testing the features of github
+Deep Learning samples code
