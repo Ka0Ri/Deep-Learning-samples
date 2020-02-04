@@ -10,86 +10,125 @@
 from tqdm import tqdm
 import torch
 import torch.optim
+import torch.nn as nn
 import torchnet as tnt
 from torch.autograd import Variable
 import torch.nn.functional as F
-from torch.nn.init import kaiming_normal
 from torchnet.engine import Engine
-from torchnet.logger import VisdomPlotLogger, VisdomLogger
-from torchvision.datasets.mnist import MNIST
+from torchvision.datasets.mnist import MNIST, FashionMNIST
+from torchvision import transforms
+from torch.utils.data import Dataset, DataLoader, TensorDataset
+from ults import *
+
+import numpy as np
+import os
+
+data_path = os.path.dirname(os.getcwd()) + "/data/"
 
 
-def get_iterator(mode):
-    ds = MNIST(root='./', download=True, train=mode)
-    data = getattr(ds, 'train_data' if mode else 'test_data')
-    labels = getattr(ds, 'train_labels' if mode else 'test_labels')
-    tds = tnt.dataset.TensorDataset([data, labels])
-    return tds.parallel(batch_size=128, num_workers=4, shuffle=mode)
+option = Options()
+option.setup_config()
+args = option.opt
 
 
-def conv_init(ni, no, k):
-    return kaiming_normal(torch.Tensor(no, ni, k, k))
+class FashionMnistread(TensorDataset):
+    """Customized dataset loader"""
+    def __init__(self, mode, transform):
+        dataset = FashionMNIST(root=data_path, download=True, train=mode)
+        data = getattr(dataset, 'train_data' if mode else 'test_data')
+        labels = getattr(dataset, 'train_labels' if mode else 'test_labels')
+        self.transform = transform
+        self.input_images = np.array(data).astype(np.float)
+        self.input_labels = np.array(labels).astype(np.long)
 
+    def __len__(self):
+        return (self.input_images.shape[0])
 
-def linear_init(ni, no):
-    return kaiming_normal(torch.Tensor(no, ni))
+    def __getitem__(self, idx):
+        images = self.input_images[idx]
+        labels = self.input_labels[idx]
+        if self.transform is not None:
+            images = self.transform(images)
+        return images, labels
 
+class My_Model(nn.Module):
+    """Model Definition"""
+    def __init__(self, num_of_class):
+        super(My_Model, self).__init__()
+        self.layer1 = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm2d(16),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2))
+        self.layer2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=5, stride=1, padding=2),
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(kernel_size=2, stride=2))
+        self.fc = nn.Linear(7 * 7 * 32, num_of_class)
 
-def f(params, inputs, mode):
-    o = inputs.view(inputs.size(0), 1, 28, 28)
-    o = F.conv2d(o, params['conv0.weight'], params['conv0.bias'], stride=2)
-    o = F.relu(o)
-    o = F.conv2d(o, params['conv1.weight'], params['conv1.bias'], stride=2)
-    o = F.relu(o)
-    o = o.view(o.size(0), -1)
-    o = F.linear(o, params['linear2.weight'], params['linear2.bias'])
-    o = F.relu(o)
-    o = F.linear(o, params['linear3.weight'], params['linear3.bias'])
-    return o
-
-
-class Visualier():
-    def __init__(self, num_classes=10):
-
-        port = 8097
-        self.loss_logger = VisdomPlotLogger('line', port=port, win = "Loss", opts={'title': 'Loss Logger'})
-        self.acc_logger = VisdomPlotLogger('line', port=port, opts={'title': 'Accuracy Logger'})
-        self.confusion_logger = VisdomLogger('heatmap', port=port, opts={'title': 'Confusion matrix',
-                                                                'columnnames': list(range(num_classes)),
-                                                                'rownames': list(range(num_classes))})
-    
-    def plot(self, train_acc, train_err, val_acc, val_err, confusion, epochs):
-        self.loss_logger.log(epochs, train_err, name="train")
-        self.acc_logger.log(epochs, train_acc, name="train")
-        self.loss_logger.log(epochs, val_err, name="val")
-        self.acc_logger.log(epochs, val_acc, name="val")
-        self.confusion_logger.log(confusion)
+    def forward(self, x):
+        out = self.layer1(x)
+        out = self.layer2(out)
+        out = out.reshape(out.size(0), -1)
+        out = self.fc(out)
+        out = F.softmax(out, dim=1)
+        return out
 
 
 def main():
-    params = {
-        'conv0.weight': conv_init(1, 50, 5), 'conv0.bias': torch.zeros(50),
-        'conv1.weight': conv_init(50, 50, 5), 'conv1.bias': torch.zeros(50),
-        'linear2.weight': linear_init(800, 512), 'linear2.bias': torch.zeros(512),
-        'linear3.weight': linear_init(512, 10), 'linear3.bias': torch.zeros(10),
-    }
-    params = {k: Variable(v, requires_grad=True) for k, v in params.items()}
 
-    optimizer = torch.optim.SGD(
-        params.values(), lr=0.01, momentum=0.9, weight_decay=0.0005)
+    ###Initialization
+    device = torch.device(args.device)
+
+    My_transform = transforms.Compose([
+        transforms.ToTensor(),# default : range [0, 255] -> [0.0,1.0]
+        ])
+
+    Train_data = FashionMnistread(True, transform=My_transform)
+    Test_data = FashionMnistread(False, transform=My_transform)
+
+    Train_dataloader = DataLoader(dataset=Train_data, batch_size = args.n_batches, shuffle=False)
+    Test_dataloader = DataLoader(dataset=Test_data, batch_size = args.n_batches, shuffle=False)
+
+    def get_iterator(mode):
+        if mode is True:
+            return Train_dataloader
+        elif mode is False:
+            return Test_dataloader
+
+    
+    from torchsummary import summary
+    _model = My_Model(num_of_class = args.n_classes)
+    _model.to(device)
+    summary(_model, input_size=(1, 28, 28))
+
+    optimizer = torch.optim.SGD(_model.parameters(), lr=args.lr, momentum=args.momentum, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss()
 
     engine = Engine()
     meter_loss = tnt.meter.AverageValueMeter()
     classerr = tnt.meter.ClassErrorMeter(accuracy=True)
-    confusion_meter = tnt.meter.ConfusionMeter(10, normalized=True)
+    confusion_meter = tnt.meter.ConfusionMeter(args.n_classes, normalized=True)
 
-    plotLogger = Visualier(num_classes = 10)
+    plotLogger = Visualier(num_classes = args.n_classes)
+    writelogger = Customized_Logger(file_name=args.log_file)
+    ###End Initialization
 
     def h(sample):
-        inputs = Variable(sample[0].float() / 255.0)
-        targets = Variable(torch.LongTensor(sample[1]))
-        o = f(params, inputs, sample[2])
-        return F.cross_entropy(o, targets), o
+        data, classes, training = sample
+       
+        _model.train() if training else _model.eval()
+            
+        labels = torch.LongTensor(classes).to(device)
+        data = data.to(device).float()
+        
+        f_class = _model(data)
+        loss = criterion(f_class, labels)
+        
+        p_class = F.softmax(f_class, dim=1)
+        return loss, p_class
+            
 
     def reset_meters():
         classerr.reset()
@@ -109,7 +148,7 @@ def main():
         state['iterator'] = tqdm(state['iterator'])
 
     def on_end_epoch(state):
-        print('Training loss: %.4f, accuracy: %.2f%%' % (meter_loss.value()[0], classerr.value()[0]))
+        
         train_acc =  classerr.value()[0]
         train_err = meter_loss.value()[0]
 
@@ -119,16 +158,17 @@ def main():
    
         val_acc =  classerr.value()[0]
         val_err = meter_loss.value()[0]
-        plotLogger.plot(train_acc = train_acc, train_err = train_err, val_acc = val_acc, val_err = val_err, 
+        plotLogger.plot(train_acc=train_acc, train_err=train_err, val_acc=val_acc, val_err=val_err, 
                         confusion = confusion_meter.value(),
-                        epochs =state['epoch'] )
-        print('Testing loss: %.4f, accuracy: %.2f%%' % (meter_loss.value()[0], classerr.value()[0]))
+                        epoch =state['epoch'])
+        writelogger.update(train_acc=train_acc, train_err=train_err, val_acc=val_acc, val_err=val_err, epoch=state['epoch'], model=_model)
+        
 
     engine.hooks['on_sample'] = on_sample
     engine.hooks['on_forward'] = on_forward
     engine.hooks['on_start_epoch'] = on_start_epoch
     engine.hooks['on_end_epoch'] = on_end_epoch
-    engine.train(h, get_iterator(True), maxepoch=20, optimizer=optimizer)
+    engine.train(h, get_iterator(True), maxepoch=args.n_epoches, optimizer=optimizer)
 
 
 if __name__ == '__main__':
